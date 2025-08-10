@@ -11,6 +11,58 @@ from nanovllm.engine.sequence import Sequence
 from nanovllm.engine.scheduler import Scheduler
 from nanovllm.engine.model_runner import ModelRunner
 
+# -----------------------------------------------------------------------------
+# LLMEngine: Architecture Overview
+#
+# The LLMEngine class orchestrates the end-to-end process of large language model
+# inference, managing model runners, scheduling, tokenization, and request handling.
+#
+# Key Components:
+#   - ModelRunner: Handles the actual model computation, possibly across multiple
+#     processes for tensor parallelism.
+#   - Scheduler: Manages the queue of sequences (requests), schedules prefill and
+#     decode steps, and handles postprocessing.
+#   - Tokenizer: Converts between text and token IDs using HuggingFace's transformers.
+#   - Config: Stores all configuration parameters for the engine and model.
+#
+# High-Level Workflow:
+#   1. Initialization:
+#      - Loads configuration and tokenizer.
+#      - Spawns ModelRunner processes for tensor parallelism.
+#      - Initializes the Scheduler.
+#   2. Request Handling:
+#      - add_request: Accepts a prompt (string or token IDs) and sampling parameters,
+#        encodes if necessary, wraps in a Sequence, and adds to the Scheduler.
+#   3. Inference Loop:
+#      - step: Scheduler selects sequences for prefill or decode.
+#      - ModelRunner(s) process the sequences and return token IDs.
+#      - Scheduler postprocesses outputs, updates sequence states.
+#      - Outputs are collected for finished sequences.
+#   4. Generation:
+#      - generate: High-level API for batch generation, iteratively calls step()
+#        until all sequences are finished, optionally displaying progress.
+#   5. Cleanup:
+#      - exit: Ensures all ModelRunner processes are properly terminated.
+#
+# Visualization:
+#
+# +-------------------+         +-------------------+         +-------------------+
+# |   LLMEngine       |<------->|   Scheduler       |<------->|   Sequence        |
+# |-------------------|         |-------------------|         |-------------------|
+# | - model_runner(s) |         | - queue           |         | - prompt          |
+# | - scheduler       |         | - schedule()      |         | - sampling_params |
+# | - tokenizer       |         | - postprocess()   |         | - completion      |
+# | - config          |         +-------------------+         +-------------------+
+# | - add_request()   |
+# | - step()          |         +-------------------+
+# | - generate()      |-------->|   ModelRunner     |<--------> (Model, GPU, etc.)
+# | - exit()          |         +-------------------+
+# +-------------------+
+#
+# This modular architecture enables efficient, parallel, and scalable LLM inference,
+# supporting batching, streaming, and advanced scheduling for high-throughput serving.
+# -----------------------------------------------------------------------------
+
 
 class LLMEngine:
 

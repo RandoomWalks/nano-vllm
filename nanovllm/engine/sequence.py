@@ -4,6 +4,67 @@ from itertools import count
 
 from nanovllm.sampling_params import SamplingParams
 
+# -----------------------------------------------------------------------------
+# Sequence and SequenceStatus: Architecture Overview
+#
+# The Sequence and SequenceStatus classes together represent and manage the state
+# of a single text generation request as it flows through the LLM inference engine.
+#
+# Key Concepts:
+#   - Sequence:
+#       * Encapsulates all information about a single generation request, including
+#         its prompt tokens, sampling parameters, current status, and memory block usage.
+#       * Tracks both prompt and generated (completion) tokens, as well as how many
+#         tokens are cached in memory blocks for efficient reuse.
+#       * Each Sequence is assigned a unique seq_id for tracking and scheduling.
+#       * Supports properties for easy access to prompt/completion tokens, status,
+#         and block-level memory management.
+#   - SequenceStatus (Enum):
+#       * Enumerates the possible states of a Sequence:
+#           - WAITING: The sequence is queued and not yet running.
+#           - RUNNING: The sequence is actively being processed (prefill or decode).
+#           - FINISHED: The sequence has completed generation (e.g., hit EOS or max tokens).
+#
+# High-Level Workflow:
+#   1. Creation:
+#       - A Sequence is instantiated with a list of token IDs (prompt) and sampling parameters.
+#       - It starts in the WAITING state, ready to be scheduled.
+#   2. Scheduling:
+#       - The Scheduler moves Sequences from WAITING to RUNNING as resources allow.
+#       - The Sequence tracks which tokens are cached and which are newly generated.
+#   3. Generation:
+#       - As tokens are generated, they are appended to the Sequence's token_ids.
+#       - The Sequence updates its status and memory block usage accordingly.
+#   4. Completion:
+#       - When generation is finished (EOS or max tokens), the Sequence status is set to FINISHED.
+#       - The Sequence's completion_token_ids property provides the generated output.
+#
+# Visualization:
+#
+# +-------------------+         +-------------------+
+# |   Sequence        |<------->|   SequenceStatus  |
+# |-------------------|         |-------------------|
+# | seq_id            |         | WAITING           |
+# | status            |         | RUNNING           |
+# | token_ids         |         | FINISHED          |
+# | num_tokens        |         +-------------------+
+# | num_prompt_tokens |
+# | num_cached_tokens |
+# | block_table       |
+# | temperature       |
+# | max_tokens        |
+# | ignore_eos        |
+# +-------------------+
+#         |   ^
+#         |   | (status transitions)
+#         v   |
+#   (Tracks prompt, completion, and memory usage)
+#
+# This design enables efficient, stateful management of each generation request,
+# supporting batching, memory sharing, and flexible scheduling in high-throughput
+# LLM inference systems.
+# -----------------------------------------------------------------------------
+
 
 class SequenceStatus(Enum):
     WAITING = auto()

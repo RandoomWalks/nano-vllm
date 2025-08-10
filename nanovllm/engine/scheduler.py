@@ -5,6 +5,64 @@ from nanovllm.engine.sequence import Sequence, SequenceStatus
 from nanovllm.engine.block_manager import BlockManager
 
 
+# -----------------------------------------------------------------------------
+# Scheduler: Architecture Overview
+#
+# The Scheduler class is responsible for managing the lifecycle and batching of
+# inference requests (Sequences) for large language model serving. It orchestrates
+# the flow of sequences through different states (waiting, running), determines
+# which sequences are ready for prefill (initial prompt processing) or decode
+# (incremental token generation), and interacts with the BlockManager to allocate
+# and manage memory for KV cache blocks.
+#
+# Key Components:
+#   - Sequence Queues:
+#       * waiting: Sequences that are queued for processing but not yet running.
+#       * running: Sequences that are actively being processed (prefill or decode).
+#   - BlockManager:
+#       * Handles allocation and management of KV cache blocks for each sequence.
+#   - Scheduling Logic:
+#       * Determines which sequences can be scheduled for prefill or decode based
+#         on resource constraints (max sequences, max batched tokens, available blocks).
+#       * Handles preemption and appending of tokens for running sequences.
+#
+# High-Level Workflow:
+#   1. Adding Requests:
+#       - New sequences are added to the waiting queue via add().
+#   2. Scheduling (schedule()):
+#       - Prefill Phase:
+#           * Selects as many waiting sequences as possible (up to max_num_seqs and
+#             max_num_batched_tokens), allocates KV cache blocks, and moves them to running.
+#       - Decode Phase:
+#           * For running sequences, checks if more tokens can be appended (using BlockManager).
+#           * Handles preemption if resources are insufficient.
+#           * Schedules eligible sequences for decoding.
+#   3. Postprocessing:
+#       - After model execution, updates sequence status and handles completion.
+#   4. Completion Check:
+#       - is_finished() returns True when all sequences are processed.
+#
+# Visualization:
+#
+# +-------------------+         +-------------------+         +-------------------+
+# |   Scheduler       |<------->|   BlockManager    |<------->|   Block           |
+# |-------------------|         |-------------------|         |-------------------|
+# | waiting: [Seq]    |         | alloc/dealloc     |         | KV cache          |
+# | running: [Seq]    |         | can_allocate()    |         | ref_count, hash   |
+# | add(seq)          |         | allocate(seq)     |         +-------------------+
+# | schedule()        |         | can_append(seq)   |
+# | postprocess()     |         | may_append(seq)   |
+# +-------------------+         +-------------------+
+#         |   ^
+#         |   | (add, schedule, postprocess)
+#         v   |
+#   (Sequences flow through waiting -> running -> finished)
+#
+# This architecture enables efficient batching, resource-aware scheduling, and
+# high-throughput inference for LLM serving, while managing memory via block-based
+# KV cache allocation.
+# -----------------------------------------------------------------------------
+
 class Scheduler:
 
     def __init__(self, config: Config):

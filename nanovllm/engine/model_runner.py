@@ -11,6 +11,65 @@ from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
 
+# -----------------------------------------------------------------------------
+# ModelRunner: Architecture Overview
+#
+# The ModelRunner class is responsible for executing the actual model computations
+# (forward passes, sampling, and KV cache management) for large language model inference.
+# It is designed to support tensor parallelism by running in multiple processes,
+# each handling a shard of the model, and synchronizing via torch.distributed.
+#
+# Key Components:
+#   - Model Initialization:
+#       * Loads the model configuration and weights (e.g., Qwen3ForCausalLM).
+#       * Sets up the device, dtype, and distributed process group (NCCL backend).
+#   - KV Cache Management:
+#       * Allocates memory for key/value caches, typically in blocks for efficient reuse.
+#   - CUDA Graphs (Optional):
+#       * If not enforcing eager execution, captures CUDA graphs for fast repeated inference.
+#   - Inter-Process Communication:
+#       * For tensor parallelism (world_size > 1), uses shared memory (multiprocessing.SharedMemory)
+#         and distributed barriers to synchronize requests and results between processes.
+#   - Sampler:
+#       * Handles sampling of output tokens from model logits, supporting various strategies.
+#   - Warmup:
+#       * Runs a dummy forward pass to initialize CUDA kernels and memory.
+#
+# High-Level Workflow:
+#   1. Initialization:
+#       - Each process initializes its model shard, device, and communication primitives.
+#       - Rank 0 creates shared memory for request/result exchange; other ranks attach to it.
+#   2. Inference Loop (for worker processes):
+#       - Waits for requests via shared memory.
+#       - Executes the requested method (e.g., run, exit) with provided arguments.
+#       - Writes results back to shared memory and signals completion.
+#   3. Model Execution:
+#       - Receives a batch of Sequences (prompts and sampling params).
+#       - Runs the model forward pass, updates KV cache, and samples next tokens.
+#       - Returns generated token IDs to the caller.
+#   4. Cleanup:
+#       - Properly closes shared memory, destroys process group, and releases resources.
+#
+# Visualization:
+#
+# +-------------------+         +-------------------+         +-------------------+
+# |   LLMEngine       |<------->|   ModelRunner(s)  |<------->|   Model Shard     |
+# |-------------------|         |-------------------|         |-------------------|
+# | - scheduler       |         | - model           |         | - Qwen3ForCausalLM|
+# | - tokenizer       |         | - sampler         |         | - KV cache        |
+# | - model_runner(s) |<------->| - shared memory   |         +-------------------+
+# +-------------------+         | - dist group      |
+#                               | - cuda graphs     |
+#                               +-------------------+
+#                                       ^
+#                                       |
+#                                 (Inter-process
+#                                  communication)
+#
+# This architecture enables efficient, parallel, and scalable execution of LLM inference,
+# supporting tensor parallelism, fast memory management, and high-throughput serving.
+# -----------------------------------------------------------------------------
+
 
 class ModelRunner:
 

@@ -4,6 +4,54 @@ import numpy as np
 
 from nanovllm.engine.sequence import Sequence
 
+# -----------------------------------------------------------------------------
+# BlockManager and Block: Architecture Overview
+#
+# The BlockManager and Block classes together implement a block-based memory
+# management system for storing and reusing token sequences (e.g., for LLM KV cache).
+#
+# Key Concepts:
+#   - "Block": A fixed-size container for a chunk of token IDs, with a unique ID,
+#     a reference count, a hash for fast lookup, and the actual token IDs.
+#   - "BlockManager": Manages a pool of Blocks, handling allocation, dealllocation,
+#     and deduplication via hashing.
+#
+# BlockManager Responsibilities:
+#   - Maintains a pool of Block objects (self.blocks).
+#   - Tracks which blocks are free (self.free_block_ids) and which are in use (self.used_block_ids).
+#   - Maps content hashes to block IDs for deduplication (self.hash_to_block_id).
+#   - Provides methods to allocate and deallocate blocks, and to compute hashes for token sequences.
+#
+# Block Responsibilities:
+#   - Stores its own block_id, reference count, hash, and token_ids.
+#   - Can be updated with new content and reset to an initial state.
+#
+# Typical Workflow:
+#   1. When a new sequence or chunk of tokens needs to be stored, BlockManager computes its hash.
+#   2. If a block with the same hash exists (deduplication), its ref_count is incremented.
+#   3. Otherwise, a free block is allocated, initialized with the token_ids and hash, and tracked.
+#   4. When a block is no longer needed (ref_count drops to zero), it is deallocated and returned to the free pool.
+#
+# Visualization:
+#
+# +-------------------+         +-------------------+
+# | BlockManager      |         | Block             |
+# |-------------------|         |-------------------|
+# | blocks: [Block]   |<------->| block_id          |
+# | free_block_ids    |         | ref_count         |
+# | used_block_ids    |         | hash              |
+# | hash_to_block_id  |         | token_ids         |
+# +-------------------+         +-------------------+
+#         |   ^  (alloc/dealloc)         ^
+#         |   |--------------------------|
+#         |   | (reset/update)
+#         v   |
+#   (allocate, deallocate, lookup, hash)
+#
+# This architecture enables efficient memory usage and fast lookup for repeated
+# token sequences, which is critical for high-throughput LLM inference.
+# -----------------------------------------------------------------------------
+
 
 class Block:
 
