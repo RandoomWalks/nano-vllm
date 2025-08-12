@@ -16,6 +16,9 @@ from nanovllm.engine.model_runner import ModelRunner
 #
 # The LLMEngine class orchestrates the end-to-end process of large language model
 # inference, managing model runners, scheduling, tokenization, and request handling.
+
+#? Tensor parallel rank refers to the index of a process in tensor parallelism, where a model is split across multiple processes/devices (usually GPUs), each handling a shard of the model.
+
 #
 # Key Components:
 #   - ModelRunner: Handles the actual model computation, possibly across multiple
@@ -28,12 +31,16 @@ from nanovllm.engine.model_runner import ModelRunner
 # High-Level Workflow:
 #   1. Initialization:
 #      - Loads configuration and tokenizer.
-#      - Spawns ModelRunner processes for tensor parallelism.
+#      - Spawns multiple ModelRunner processes (one per tensor parallel rank, except rank 0) to enable tensor parallelism.
 #      - Initializes the Scheduler.
 #   2. Request Handling:
 #      - add_request: Accepts a prompt (string or token IDs) and sampling parameters,
 #        encodes if necessary, wraps in a Sequence, and adds to the Scheduler.
 #   3. Inference Loop:
+#? Prefill is the initial phase where the model processes the full prompt for each new sequence, filling the key/value (KV) cache with prompt tokens before generating new tokens. This is done before the decode phase, which generates tokens one at a time.
+
+#? Decode is the phase where the model generates new tokens one at a time for each sequence, using the KV cache filled during prefill to efficiently continue generation.
+
 #      - step: Scheduler selects sequences for prefill or decode.
 #      - ModelRunner(s) process the sequences and return token IDs.
 #      - Scheduler postprocesses outputs, updates sequence states.

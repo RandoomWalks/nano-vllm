@@ -13,14 +13,15 @@ from nanovllm.engine.sequence import Sequence
 # Key Concepts:
 #   - "Block": A fixed-size container for a chunk of token IDs, with a unique ID,
 #     a reference count, a hash for fast lookup, and the actual token IDs.
-#   - "BlockManager": Manages a pool of Blocks, handling allocation, dealllocation,
-#     and deduplication via hashing.
+#   - "BlockManager": Manages a pool of Blocks, handling allocation, dealllocation, and deduplication via hashing.
 #
 # BlockManager Responsibilities:
 #   - Maintains a pool of Block objects (self.blocks).
 #   - Tracks which blocks are free (self.free_block_ids) and which are in use (self.used_block_ids).
-#   - Maps content hashes to block IDs for deduplication (self.hash_to_block_id).
+#   - Uses self.hash_to_block_id to map a hash of token_ids (e.g., hash([1,2,3])) to a block ID, so repeated token chunks share the same block.
 #   - Provides methods to allocate and deallocate blocks, and to compute hashes for token sequences.
+
+
 #
 # Block Responsibilities:
 #   - Stores its own block_id, reference count, hash, and token_ids.
@@ -31,7 +32,90 @@ from nanovllm.engine.sequence import Sequence
 #   2. If a block with the same hash exists (deduplication), its ref_count is incremented.
 #   3. Otherwise, a free block is allocated, initialized with the token_ids and hash, and tracked.
 #   4. When a block is no longer needed (ref_count drops to zero), it is deallocated and returned to the free pool.
+
+# -----------------------------------------------------------------------------
+#! BlockManager/Block: Walkthrough Example
 #
+# Let's walk through a concrete example of how BlockManager and Block work together
+# to manage memory for token sequences in an LLM KV cache.
+#
+# Suppose:
+#   - block_size = 4
+#   - num_blocks = 3
+#   - We want to store token sequences for two requests:
+#       * seq1: [10, 20, 30, 40, 50, 60]
+#       * seq2: [10, 20, 30, 40, 70, 80]
+#
+# Step 1: BlockManager Initialization
+#   - Creates 3 Block objects (IDs 0, 1, 2), all free.
+#   - free_block_ids = [0, 1, 2]
+#   - used_block_ids = set()
+#   - hash_to_block_id = {}
+#
+# Step 2: Allocate blocks for seq1 ([10, 20, 30, 40, 50, 60])
+#   - Split seq1 into 2 blocks of size 4:
+#       * blockA: [10, 20, 30, 40]
+#       * blockB: [50, 60]
+#   - For blockA:
+#       * Compute hash of [10, 20, 30, 40] (e.g., hA = 12345)
+#       * hash_to_block_id does not contain hA, so allocate block 0:
+#           - block 0: ref_count=1, hash=hA, token_ids=[10,20,30,40]
+#           - free_block_ids = [1,2]
+#           - used_block_ids = {0}
+#           - hash_to_block_id[hA] = 0
+#   - For blockB:
+#       * Compute hash of [50, 60] (e.g., hB = 67890)
+#       * hash_to_block_id does not contain hB, so allocate block 1:
+#           - block 1: ref_count=1, hash=hB, token_ids=[50,60]
+#           - free_block_ids = [2]
+#           - used_block_ids = {0,1}
+#           - hash_to_block_id[hB] = 1
+#
+# Step 3: Allocate blocks for seq2 ([10, 20, 30, 40, 70, 80])
+#   - Split seq2 into 2 blocks:
+#       * blockA: [10, 20, 30, 40]  (same as seq1's blockA)
+#       * blockC: [70, 80]
+#   - For blockA:
+#       * Compute hash hA (already in hash_to_block_id)
+#       * block 0 is reused: ref_count += 1 (now 2)
+#   - For blockC:
+#       * Compute hash of [70, 80] (e.g., hC = 54321)
+#       * hash_to_block_id does not contain hC, so allocate block 2:
+#           - block 2: ref_count=1, hash=hC, token_ids=[70,80]
+#           - free_block_ids = []
+#           - used_block_ids = {0,1,2}
+#           - hash_to_block_id[hC] = 2
+#
+# Step 4: Deallocate seq1
+#   - Decrement ref_count for its blocks:
+#       * block 0: ref_count = 1 (still used by seq2)
+#       * block 1: ref_count = 0 (no longer used)
+#           - Remove hB from hash_to_block_id
+#           - block 1 is reset and added to free_block_ids
+#           - used_block_ids = {0,2}
+#
+# Step 5: Deallocate seq2
+#   - Decrement ref_count for its blocks:
+#       * block 0: ref_count = 0 (no longer used)
+#           - Remove hA from hash_to_block_id
+#           - block 0 is reset and added to free_block_ids
+#           - used_block_ids = {2}
+#       * block 2: ref_count = 0 (no longer used)
+#           - Remove hC from hash_to_block_id
+#           - block 2 is reset and added to free_block_ids
+#           - used_block_ids = set()
+#
+# Final state:
+#   - All blocks are free and reset.
+#   - free_block_ids = [1,0,2] (order may vary)
+#   - used_block_ids = set()
+#   - hash_to_block_id = {}
+#
+# This example shows how blocks are allocated, reused (deduplicated), and freed
+# as sequences are processed, enabling efficient memory management for LLM serving.
+# -----------------------------------------------------------------------------
+
+
 # Visualization:
 #
 # +-------------------+         +-------------------+
