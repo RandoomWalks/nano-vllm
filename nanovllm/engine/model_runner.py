@@ -176,12 +176,31 @@ class ModelRunner:
                 layer_id += 1
 
     def prepare_block_tables(self, seqs: list[Sequence]):
+        if not seqs:
+            return torch.empty((0, 0), dtype=torch.int32, device='cuda')
+        
         max_len = max(len(seq.block_table) for seq in seqs)
-        block_tables = [seq.block_table + [-1] * (max_len - len(seq.block_table)) for seq in seqs]
-        block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        if max_len == 0:
+            return torch.empty((len(seqs), 0), dtype=torch.int32, device='cuda')
+        
+        # Pre-allocate tensor on GPU to avoid CPU->GPU transfer
+        block_tables = torch.full((len(seqs), max_len), -1, dtype=torch.int32, device='cuda')
+        
+        # Fill in block tables efficiently
+        for i, seq in enumerate(seqs):
+            if seq.block_table:
+                block_tables[i, :len(seq.block_table)] = torch.tensor(seq.block_table, dtype=torch.int32, device='cuda')
+        
         return block_tables
 
     def prepare_prefill(self, seqs: list[Sequence]):
+        if not seqs:
+            return torch.empty(0, dtype=torch.int64, device='cuda'), torch.empty(0, dtype=torch.int64, device='cuda')
+        
+        # Pre-calculate total lengths to avoid list resizing
+        total_input_tokens = sum(len(seq) - seq.num_cached_tokens for seq in seqs)
+        total_slot_tokens = sum(seq.num_blocks * self.block_size for seq in seqs if seq.block_table)
+        
         input_ids = []
         positions = []
         cu_seqlens_q = [0]
@@ -189,59 +208,81 @@ class ModelRunner:
         max_seqlen_q = 0
         max_seqlen_k = 0
         slot_mapping = []
+        
+        # Reserve capacity to avoid reallocations
+        input_ids.reserve(total_input_tokens) if hasattr(list, 'reserve') else None
+        positions.reserve(total_input_tokens) if hasattr(list, 'reserve') else None
+        slot_mapping.reserve(total_slot_tokens) if hasattr(list, 'reserve') else None
+        
         block_tables = None
         for seq in seqs:
             seqlen = len(seq)
-            input_ids.extend(seq[seq.num_cached_tokens:])
-            positions.extend(list(range(seq.num_cached_tokens, seqlen)))
             seqlen_q = seqlen - seq.num_cached_tokens
             seqlen_k = seqlen
+            
+            # Extend lists efficiently
+            input_ids.extend(seq[seq.num_cached_tokens:])
+            positions.extend(range(seq.num_cached_tokens, seqlen))
+            
             cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
             cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
             max_seqlen_q = max(seqlen_q, max_seqlen_q)
             max_seqlen_k = max(seqlen_k, max_seqlen_k)
-            if not seq.block_table:
-                continue
-            for i in range(seq.num_cached_blocks, seq.num_blocks):
-                start = seq.block_table[i] * self.block_size
-                if i != seq.num_blocks - 1:
-                    end = start + self.block_size
-                else:
-                    end = start + seq.last_block_num_tokens 
-                slot_mapping.extend(list(range(start, end)))
+            
+            if seq.block_table:
+                for i in range(seq.num_cached_blocks, seq.num_blocks):
+                    start = seq.block_table[i] * self.block_size
+                    if i != seq.num_blocks - 1:
+                        end = start + self.block_size
+                    else:
+                        end = start + seq.last_block_num_tokens 
+                    slot_mapping.extend(range(start, end))
+        
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
             block_tables = self.prepare_block_tables(seqs)
-        input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        
+        # Create tensors directly on GPU to avoid CPU->GPU transfer
+        input_ids = torch.tensor(input_ids, dtype=torch.int64, device='cuda')
+        positions = torch.tensor(positions, dtype=torch.int64, device='cuda')
+        cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, device='cuda')
+        cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, device='cuda')
+        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, device='cuda')
+        
         set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
         return input_ids, positions
 
     def prepare_decode(self, seqs: list[Sequence]):
-        input_ids = []
-        positions = []
-        slot_mapping = []
-        context_lens = []
-        for seq in seqs:
-            input_ids.append(seq.last_token)
-            positions.append(len(seq))
-            context_lens.append(len(seq))
-            slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens  - 1)
-        input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        if not seqs:
+            return torch.empty(0, dtype=torch.int64, device='cuda'), torch.empty(0, dtype=torch.int64, device='cuda')
+        
+        num_seqs = len(seqs)
+        
+        # Pre-allocate tensors directly on GPU for better performance
+        input_ids = torch.empty(num_seqs, dtype=torch.int64, device='cuda')
+        positions = torch.empty(num_seqs, dtype=torch.int64, device='cuda')
+        slot_mapping = torch.empty(num_seqs, dtype=torch.int32, device='cuda')
+        context_lens = torch.empty(num_seqs, dtype=torch.int32, device='cuda')
+        
+        # Fill tensors efficiently
+        for i, seq in enumerate(seqs):
+            input_ids[i] = seq.last_token
+            seq_len = len(seq)
+            positions[i] = seq_len
+            context_lens[i] = seq_len
+            slot_mapping[i] = seq.block_table[-1] * self.block_size + seq.last_block_num_tokens - 1
+        
         block_tables = self.prepare_block_tables(seqs)
         set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
         return input_ids, positions
 
     def prepare_sample(self, seqs: list[Sequence]):
-        temperatures = []
-        for seq in seqs:
-            temperatures.append(seq.temperature)
-        temperatures = torch.tensor(temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
+        if not seqs:
+            return torch.empty(0, dtype=torch.float32, device='cuda')
+        
+        # Pre-allocate tensor on GPU and fill directly
+        temperatures = torch.empty(len(seqs), dtype=torch.float32, device='cuda')
+        for i, seq in enumerate(seqs):
+            temperatures[i] = seq.temperature
         return temperatures
 
     @torch.inference_mode()

@@ -10,10 +10,21 @@ def apply_rotary_emb(
 ) -> torch.Tensor:
     cos = cos.unsqueeze(-2)
     sin = sin.unsqueeze(-2)
-    x1, x2 = torch.chunk(x.to(torch.float32), 2, dim=-1)
+    
+    # Avoid unnecessary dtype conversions when already in float32
+    orig_dtype = x.dtype
+    if orig_dtype == torch.float32:
+        x1, x2 = torch.chunk(x, 2, dim=-1)
+        y1 = x1 * cos - x2 * sin
+        y2 = x2 * cos + x1 * sin
+        return torch.cat((y1, y2), dim=-1)
+    
+    # Standard path with dtype conversion
+    x_float = x.to(torch.float32)
+    x1, x2 = torch.chunk(x_float, 2, dim=-1)
     y1 = x1 * cos - x2 * sin
     y2 = x2 * cos + x1 * sin
-    return torch.cat((y1, y2), dim=-1).to(x.dtype)
+    return torch.cat((y1, y2), dim=-1).to(orig_dtype)
 
 
 class RotaryEmbedding(nn.Module):
