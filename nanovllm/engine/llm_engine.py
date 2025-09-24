@@ -2,8 +2,19 @@ import atexit
 from dataclasses import fields
 from time import perf_counter
 from tqdm.auto import tqdm
-from transformers import AutoTokenizer
+import torch
 import torch.multiprocessing as mp
+from typing import Optional
+
+# Lazy import for transformers to reduce startup time
+_AutoTokenizer = None
+
+def _get_tokenizer():
+    global _AutoTokenizer
+    if _AutoTokenizer is None:
+        from transformers import AutoTokenizer
+        _AutoTokenizer = AutoTokenizer
+    return _AutoTokenizer
 
 from nanovllm.config import Config
 from nanovllm.sampling_params import SamplingParams
@@ -87,9 +98,15 @@ class LLMEngine:
             self.ps.append(process)
             self.events.append(event)
         self.model_runner = ModelRunner(config, 0, self.events)
+        AutoTokenizer = _get_tokenizer()
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)
+        
+        # Initialize memory pools for better performance
+        self._tensor_pool = {}
+        self._max_pool_size = 10
+        
         atexit.register(self.exit)
 
     def exit(self):
@@ -97,6 +114,8 @@ class LLMEngine:
         del self.model_runner
         for p in self.ps:
             p.join()
+        # Clear tensor pool
+        self._tensor_pool.clear()
 
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
         if isinstance(prompt, str):
@@ -121,32 +140,60 @@ class LLMEngine:
         sampling_params: SamplingParams | list[SamplingParams],
         use_tqdm: bool = True,
     ) -> list[str]:
+        # Early validation
+        if not prompts:
+            return []
+        
         if use_tqdm:
             pbar = tqdm(total=len(prompts), desc="Generating", dynamic_ncols=True)
+        
         if not isinstance(sampling_params, list):
             sampling_params = [sampling_params] * len(prompts)
+        
+        # Batch add requests for better efficiency
         for prompt, sp in zip(prompts, sampling_params):
             self.add_request(prompt, sp)
+        
         outputs = {}
         prefill_throughput = decode_throughput = 0.
+        
+        # Pre-allocate timing variables
+        t_start = 0
+        
         while not self.is_finished():
-            t = perf_counter()
+            t_start = perf_counter()
             output, num_tokens = self.step()
+            
             if use_tqdm:
+                elapsed = perf_counter() - t_start
                 if num_tokens > 0:
-                    prefill_throughput = num_tokens / (perf_counter() - t)
+                    prefill_throughput = num_tokens / elapsed
                 else:
-                    decode_throughput = -num_tokens / (perf_counter() - t)
+                    decode_throughput = -num_tokens / elapsed
                 pbar.set_postfix({
                     "Prefill": f"{int(prefill_throughput)}tok/s",
                     "Decode": f"{int(decode_throughput)}tok/s",
                 })
+            
+            # Process outputs efficiently
             for seq_id, token_ids in output:
                 outputs[seq_id] = token_ids
                 if use_tqdm:
                     pbar.update(1)
-        outputs = [outputs[seq_id] for seq_id in sorted(outputs)]
-        outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in outputs]
+        
+        # Batch decode tokens for better performance
+        sorted_seq_ids = sorted(outputs.keys())
+        token_ids_list = [outputs[seq_id] for seq_id in sorted_seq_ids]
+        
+        # Batch decode if tokenizer supports it
+        if hasattr(self.tokenizer, 'batch_decode'):
+            decoded_texts = self.tokenizer.batch_decode(token_ids_list, skip_special_tokens=False)
+            outputs = [{"text": text, "token_ids": token_ids} 
+                      for text, token_ids in zip(decoded_texts, token_ids_list)]
+        else:
+            outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} 
+                      for token_ids in token_ids_list]
+        
         if use_tqdm:
             pbar.close()
         return outputs

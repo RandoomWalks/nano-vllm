@@ -20,11 +20,17 @@ class RMSNorm(nn.Module):
         x: torch.Tensor,
     ) -> torch.Tensor:
         orig_dtype = x.dtype
-        x = x.to(torch.float32)
-        var = x.pow(2).mean(dim=-1, keepdim=True)
-        x.mul_(torch.rsqrt(var + self.eps))
-        x = x.to(orig_dtype).mul_(self.weight)
-        return x
+        
+        # Avoid dtype conversion if already in float32
+        if orig_dtype == torch.float32:
+            var = x.pow(2).mean(dim=-1, keepdim=True)
+            return x.mul(self.weight).div(torch.sqrt(var + self.eps))
+        
+        # Standard path with dtype conversion
+        x_float = x.to(torch.float32)
+        var = x_float.pow(2).mean(dim=-1, keepdim=True)
+        x_float.mul_(torch.rsqrt(var + self.eps))
+        return x_float.to(orig_dtype).mul_(self.weight)
 
     @torch.compile
     def add_rms_forward(
@@ -33,12 +39,22 @@ class RMSNorm(nn.Module):
         residual: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         orig_dtype = x.dtype
-        x = x.to(torch.float32).add_(residual.to(torch.float32))
-        residual = x.to(orig_dtype)
-        var = x.pow(2).mean(dim=-1, keepdim=True)
-        x.mul_(torch.rsqrt(var + self.eps))
-        x = x.to(orig_dtype).mul_(self.weight)
-        return x, residual
+        
+        # Optimize for float32 case
+        if orig_dtype == torch.float32:
+            x.add_(residual)
+            residual = x.clone()
+            var = x.pow(2).mean(dim=-1, keepdim=True)
+            x.mul_(self.weight).div_(torch.sqrt(var + self.eps))
+            return x, residual
+        
+        # Standard path with dtype conversion
+        x_float = x.to(torch.float32).add_(residual.to(torch.float32))
+        residual = x_float.to(orig_dtype)
+        var = x_float.pow(2).mean(dim=-1, keepdim=True)
+        x_float.mul_(torch.rsqrt(var + self.eps))
+        x_norm = x_float.to(orig_dtype).mul_(self.weight)
+        return x_norm, residual
 
     def forward(
         self,

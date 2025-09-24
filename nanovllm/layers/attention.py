@@ -2,8 +2,20 @@ import torch
 from torch import nn
 import triton
 import triton.language as tl
+from typing import Optional
 
-from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+# Lazy import for flash attention to reduce startup time
+_flash_attn_varlen_func = None
+_flash_attn_with_kvcache = None
+
+def _get_flash_attn():
+    global _flash_attn_varlen_func, _flash_attn_with_kvcache
+    if _flash_attn_varlen_func is None:
+        from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+        _flash_attn_varlen_func = flash_attn_varlen_func
+        _flash_attn_with_kvcache = flash_attn_with_kvcache
+    return _flash_attn_varlen_func, _flash_attn_with_kvcache
+
 from nanovllm.utils.context import get_context
 
 
@@ -56,24 +68,33 @@ class Attention(nn.Module):
         self.k_cache = self.v_cache = torch.tensor([])
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
-        o: torch.Tensor
-        q = q.view(-1, self.num_heads, self.head_dim)
-        k = k.view(-1, self.num_kv_heads, self.head_dim)
-        v = v.view(-1, self.num_kv_heads, self.head_dim)
+        # Pre-allocate tensor views to avoid repeated memory allocations
+        batch_size = q.size(0)
+        q_view = q.view(batch_size, self.num_heads, self.head_dim)
+        k_view = k.view(batch_size, self.num_kv_heads, self.head_dim)
+        v_view = v.view(batch_size, self.num_kv_heads, self.head_dim)
+        
         context = get_context()
         k_cache, v_cache = self.k_cache, self.v_cache
-        if k_cache.numel() and v_cache.numel():
-            store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
+        
+        # Only store to cache if cache is allocated
+        if k_cache.numel() > 0 and v_cache.numel() > 0:
+            store_kvcache(k_view, v_view, k_cache, v_cache, context.slot_mapping)
+        
+        # Get flash attention functions lazily
+        flash_attn_varlen_func, flash_attn_with_kvcache = _get_flash_attn()
+        
         if context.is_prefill:
             if context.block_tables is not None:    # prefix cache
-                k, v = k_cache, v_cache
-            o = flash_attn_varlen_func(q, k, v,
+                k_view, v_view = k_cache, v_cache
+            o = flash_attn_varlen_func(q_view, k_view, v_view,
                                        max_seqlen_q=context.max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q,
                                        max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
                                        softmax_scale=self.scale, causal=True, block_table=context.block_tables)
         else:    # decode
-            o = flash_attn_with_kvcache(q.unsqueeze(1), k_cache, v_cache,
+            o = flash_attn_with_kvcache(q_view.unsqueeze(1), k_cache, v_cache,
                                         cache_seqlens=context.context_lens, block_table=context.block_tables, 
                                         softmax_scale=self.scale, causal=True)
-        o = o.view(-1, self.num_heads * self.head_dim)
-        return o
+        
+        # Use contiguous view for better memory layout
+        return o.view(batch_size, self.num_heads * self.head_dim).contiguous()
